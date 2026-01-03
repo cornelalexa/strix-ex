@@ -5,6 +5,8 @@ from enum import Enum
 from fnmatch import fnmatch
 from pathlib import Path
 from typing import Any
+import json
+import time
 
 import litellm
 from jinja2 import (
@@ -25,7 +27,7 @@ from strix.tools import get_tools_prompt
 
 logger = logging.getLogger(__name__)
 
-litellm.drop_params = True
+litellm.drop_params = False
 litellm.modify_params = True
 
 _LLM_API_KEY = os.getenv("LLM_API_KEY")
@@ -35,6 +37,78 @@ _LLM_API_BASE = (
     or os.getenv("LITELLM_BASE_URL")
     or os.getenv("OLLAMA_API_BASE")
 )
+
+
+def _refresh_github_copilot_token_if_needed(model_name: str | None) -> None:
+    """Refresh GitHub Copilot API key before it expires using the access token."""
+    if not model_name or "github" not in model_name.lower() or "copilot" not in model_name.lower():
+        return
+
+    copilot_config_dir = Path.home() / ".config" / "litellm" / "github_copilot"
+    api_key_file = copilot_config_dir / "api-key.json"
+    access_token_file = copilot_config_dir / "access-token"
+
+    if not api_key_file.exists() or not access_token_file.exists():
+        return
+
+    try:
+        with open(api_key_file) as f:
+            api_key_data = json.load(f)
+
+        expires_at = api_key_data.get("expires_at", 0)
+        current_time = time.time()
+        time_until_expiry = expires_at - current_time
+
+        # Refresh if token expires in less than 5 minutes
+        if time_until_expiry < 300:
+            logger.info(
+                f"GitHub Copilot API key expiring in {max(0, time_until_expiry / 60):.0f} minutes. "
+                "Refreshing using access token..."
+            )
+
+            # Read the access token
+            with open(access_token_file) as f:
+                access_token = f.read().strip()
+
+            if not access_token:
+                logger.warning("No access token available. Clearing cache.")
+                import shutil
+                shutil.rmtree(copilot_config_dir, ignore_errors=True)
+                return
+
+            try:
+                import requests
+
+                # Use the access token to get a fresh API key from GitHub
+                response = requests.get(
+                    "https://api.github.com/copilot_internal/v2/token",
+                    headers={
+                        "Authorization": f"token {access_token}",
+                        "Accept": "application/json",
+                    },
+                    timeout=10,
+                )
+
+                if response.status_code == 200:
+                    new_api_key_data = response.json()
+                    # Update the api-key.json with new expiration
+                    api_key_data.update(new_api_key_data)
+                    api_key_data["expires_at"] = int(time.time()) + new_api_key_data.get("expires_in", 28800)
+
+                    with open(api_key_file, "w") as f:
+                        json.dump(api_key_data, f)
+
+                    logger.info("GitHub Copilot API key refreshed successfully")
+                else:
+                    logger.warning(f"API key refresh failed ({response.status_code}). Clearing cache...")
+                    import shutil
+                    shutil.rmtree(copilot_config_dir, ignore_errors=True)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"API key refresh failed: {e}. Clearing cache...")
+                import shutil
+                shutil.rmtree(copilot_config_dir, ignore_errors=True)
+    except Exception as e:  # noqa: BLE001
+        logger.debug(f"Error checking GitHub Copilot API key: {e}")
 
 
 class LLMRequestFailedError(Exception):
@@ -436,10 +510,26 @@ class LLM:
             filtered_messages.append(updated_msg)
         return filtered_messages
 
+    def _get_extra_headers(self) -> dict[str, str] | None:
+        if not self.config.model_name:
+            return None
+        model_lower = self.config.model_name.lower()
+        if "github" in model_lower and "copilot" in model_lower:
+            headers = {
+                "editor-version": "vscode/1.85.1",
+                "Copilot-Integration-Id": "vscode-chat",
+            }
+            logger.info(f"Adding GitHub Copilot headers for model: {self.config.model_name}")
+            return headers
+        return None
+
     async def _make_request(
         self,
         messages: list[dict[str, Any]],
     ) -> ModelResponse:
+        # Refresh GitHub Copilot token if needed
+        _refresh_github_copilot_token_if_needed(self.config.model_name)
+
         if not self._model_supports_vision():
             messages = self._filter_images_from_messages(messages)
 
@@ -453,6 +543,13 @@ class LLM:
             completion_args["api_key"] = _LLM_API_KEY
         if _LLM_API_BASE:
             completion_args["api_base"] = _LLM_API_BASE
+
+        extra_headers = self._get_extra_headers()
+        if extra_headers:
+            logger.info(f"Setting extra_headers: {extra_headers}")
+            completion_args["extra_headers"] = extra_headers
+        else:
+            logger.debug(f"No extra headers needed for model: {self.config.model_name}")
 
         if self._should_include_stop_param():
             completion_args["stop"] = ["</function>"]

@@ -36,9 +36,6 @@ from strix.runtime.docker_runtime import STRIX_IMAGE
 from strix.telemetry.tracer import get_global_tracer
 
 
-logging.getLogger().setLevel(logging.ERROR)
-
-
 def validate_environment() -> None:  # noqa: PLR0912, PLR0915
     console = Console()
     missing_required_vars = []
@@ -206,6 +203,13 @@ async def warm_up_llm() -> None:
         if api_base:
             completion_kwargs["api_base"] = api_base
 
+        # Add GitHub Copilot headers if needed
+        if model_name and "github" in model_name.lower() and "copilot" in model_name.lower():
+            completion_kwargs["extra_headers"] = {
+                "editor-version": "vscode/1.85.1",
+                "Copilot-Integration-Id": "vscode-chat",
+            }
+
         response = litellm.completion(**completion_kwargs)
 
         validate_llm_response(response)
@@ -218,6 +222,12 @@ async def warm_up_llm() -> None:
         error_text.append("Could not establish connection to the language model.\n", style="white")
         error_text.append("Please check your configuration and try again.\n", style="white")
         error_text.append(f"\nError: {e}", style="dim white")
+        error_text.append("\n\n", style="white")
+        error_text.append(
+            "💡 For debugging: Run with ", style="dim white"
+        )
+        error_text.append("litellm._turn_on_debug()", style="dim cyan")
+        error_text.append(" to see detailed logs\n", style="dim white")
 
         panel = Panel(
             error_text,
@@ -341,6 +351,12 @@ Examples:
             "'deep' for thorough security reviews (default). "
             "Default: deep."
         ),
+    )
+
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging to see what agents are doing. Logs saved to strix_runs/<run>/logs/",
     )
 
     args = parser.parse_args()
@@ -500,6 +516,18 @@ def main() -> None:
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
     args = parse_arguments()
+
+    # Set up logging based on --verbose flag
+    if args.verbose:
+        logging.basicConfig(
+            level=logging.DEBUG,
+            format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+            datefmt="%H:%M:%S",
+        )
+        # Also enable litellm debugging for API call visibility
+        litellm.set_verbose = True
+    else:
+        logging.getLogger().setLevel(logging.ERROR)
 
     check_docker_installed()
     pull_docker_image()
