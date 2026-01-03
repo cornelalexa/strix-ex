@@ -397,3 +397,63 @@ class DockerRuntime(AbstractRuntime):
             logger.warning("Container %s not found for destruction.", container_id)
         except DockerException as e:
             logger.warning("Failed to destroy container %s: %s", container_id, e)
+
+    async def restart_tool_server(self, container_id: str) -> None:
+        logger.info(f"Restarting tool server in container {container_id}")
+        try:
+            container = self.client.containers.get(container_id)
+            container.reload()
+
+            # Recover config from Env
+            env_vars = {}
+            if container.attrs and "Config" in container.attrs and "Env" in container.attrs["Config"]:
+                for env in container.attrs["Config"]["Env"]:
+                    if "=" in env:
+                        key, val = env.split("=", 1)
+                        env_vars[key] = val
+
+            tool_server_port = int(env_vars.get("TOOL_SERVER_PORT", 0))
+            tool_server_token = env_vars.get("TOOL_SERVER_TOKEN", "")
+            caido_port = int(env_vars.get("CAIDO_PORT", 0))
+
+            if not all([tool_server_port, tool_server_token, caido_port]):
+                logger.error("Could not recover tool server config from container environment")
+                return
+
+            # Kill existing server
+            container.exec_run("pkill -f 'python strix/runtime/tool_server.py'", user="pentester")
+            time.sleep(2)
+
+            # Get Caido Token
+            result = container.exec_run(
+                "bash -c 'source /etc/profile.d/proxy.sh && echo $CAIDO_API_TOKEN'", user="pentester"
+            )
+            caido_token = result.output.decode().strip() if result.exit_code == 0 else ""
+
+            # Start Server
+            cmd = (
+                f"bash -c 'source /etc/profile.d/proxy.sh && cd /app && "
+                f"STRIX_SANDBOX_MODE=true CAIDO_API_TOKEN={caido_token} CAIDO_PORT={caido_port} "
+                f"poetry run python strix/runtime/tool_server.py --token {tool_server_token} "
+                f"--host 0.0.0.0 --port {tool_server_port} &'"
+            )
+
+            container.exec_run(cmd, detach=True, user="pentester")
+
+            time.sleep(5)
+            logger.info("Tool server restart command issued")
+
+        except Exception as e:
+            logger.exception(f"Failed to restart tool server: {e}")
+            raise
+
+    async def check_tool_server_health(self, container_id: str, port: int) -> bool:
+        import httpx
+
+        try:
+            url = await self.get_sandbox_url(container_id, port)
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.get(f"{url}/health", timeout=5.0)
+                return response.status_code == 200
+        except Exception:
+            return False

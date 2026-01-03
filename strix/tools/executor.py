@@ -1,8 +1,12 @@
+import asyncio
 import inspect
+import logging
 import os
 from typing import Any
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 
 if os.getenv("STRIX_SANDBOX_MODE", "false").lower() == "false":
@@ -50,9 +54,6 @@ async def _execute_tool_in_sandbox(tool_name: str, agent_state: Any, **kwargs: A
 
     runtime = get_runtime()
     tool_server_port = agent_state.sandbox_info["tool_server_port"]
-    server_url = await runtime.get_sandbox_url(agent_state.sandbox_id, tool_server_port)
-    request_url = f"{server_url}/execute"
-
     agent_id = getattr(agent_state, "agent_id", "unknown")
 
     request_data = {
@@ -71,22 +72,65 @@ async def _execute_tool_in_sandbox(tool_name: str, agent_state: Any, **kwargs: A
         connect=SANDBOX_CONNECT_TIMEOUT,
     )
 
-    async with httpx.AsyncClient(trust_env=False) as client:
+    max_retries = 2
+    last_exception = None
+
+    for attempt in range(max_retries):
         try:
-            response = await client.post(
-                request_url, json=request_data, headers=headers, timeout=timeout
-            )
-            response.raise_for_status()
-            response_data = response.json()
-            if response_data.get("error"):
-                raise RuntimeError(f"Sandbox execution error: {response_data['error']}")
-            return response_data.get("result")
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 401:
-                raise RuntimeError("Authentication failed: Invalid or missing sandbox token") from e
-            raise RuntimeError(f"HTTP error calling tool server: {e.response.status_code}") from e
-        except httpx.RequestError as e:
-            raise RuntimeError(f"Request error calling tool server: {e}") from e
+            server_url = await runtime.get_sandbox_url(agent_state.sandbox_id, tool_server_port)
+            request_url = f"{server_url}/execute"
+
+            async with httpx.AsyncClient(trust_env=False) as client:
+                response = await client.post(
+                    request_url, json=request_data, headers=headers, timeout=timeout
+                )
+                response.raise_for_status()
+                response_data = response.json()
+                if response_data.get("error"):
+                    raise RuntimeError(f"Sandbox execution error: {response_data['error']}")
+                return response_data.get("result")
+
+        except (httpx.RequestError, httpx.HTTPStatusError, RuntimeError) as e:
+            last_exception = e
+
+            # If it's a tool execution error (e.g. invalid args), don't retry
+            if isinstance(e, RuntimeError) and "Sandbox execution error" in str(e):
+                raise
+
+            if attempt == max_retries - 1:
+                break
+
+            logger.warning(f"Tool execution failed (attempt {attempt+1}/{max_retries}): {e}")
+
+            try:
+                is_healthy = await runtime.check_tool_server_health(
+                    agent_state.sandbox_id, tool_server_port
+                )
+                if not is_healthy:
+                    logger.warning(
+                        f"Tool server unhealthy in container {agent_state.sandbox_id}, restarting..."
+                    )
+                    await runtime.restart_tool_server(agent_state.sandbox_id)
+                    await asyncio.sleep(5)  # Wait for restart
+                else:
+                    logger.info("Tool server appears healthy, retrying request...")
+                    await asyncio.sleep(1)
+            except Exception as health_e:
+                logger.error(f"Failed during health check/recovery: {health_e}")
+
+    # If we get here, we failed
+    if isinstance(last_exception, httpx.HTTPStatusError):
+        if last_exception.response.status_code == 401:
+            raise RuntimeError(
+                "Authentication failed: Invalid or missing sandbox token"
+            ) from last_exception
+        raise RuntimeError(
+            f"HTTP error calling tool server: {last_exception.response.status_code}"
+        ) from last_exception
+    elif isinstance(last_exception, httpx.RequestError):
+        raise RuntimeError(f"Request error calling tool server: {last_exception}") from last_exception
+    else:
+        raise last_exception
 
 
 async def _execute_tool_locally(tool_name: str, agent_state: Any | None, **kwargs: Any) -> Any:
