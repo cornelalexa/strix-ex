@@ -206,11 +206,13 @@ class BaseAgent(metaclass=AgentMeta):
             try:
                 should_finish = await self._process_iteration(tracer)
                 if should_finish:
-                    if self.non_interactive:
+                    # If non-interactive OR if it's a sub-agent (has parent), exit on completion
+                    if self.non_interactive or self.state.parent_id:
                         self.state.set_completed({"success": True})
                         if tracer:
                             tracer.update_agent_status(self.state.agent_id, "completed")
                         return self.state.final_result or {}
+                    
                     await self._enter_waiting_state(tracer, task_completed=True)
                     continue
 

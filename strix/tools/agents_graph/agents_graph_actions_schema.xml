@@ -33,6 +33,13 @@ Use this tool when:
       <parameter name="final_recommendations" type="string" required="false">
         <description>Recommendations for next steps or follow-up actions</description>
       </parameter>
+      <parameter name="spawn_requests" type="List[Dict[str, Any]]" required="false">
+        <description>List of agents you recommend spawning to investigate findings further.
+Each request should be a dictionary with:
+- name: str (Name of the agent)
+- task: str (Detailed task description)
+- prompt_modules: str (Optional, comma-separated list of modules)</description>
+      </parameter>
     </parameters>
     <returns type="Dict[str, Any]">
       <description>Response containing: - agent_completed: Whether the agent was marked as completed - parent_notified: Whether parent was notified (if applicable) - completion_summary: Summary of completion status</description>
@@ -53,6 +60,18 @@ Use this tool when:
   <parameter=final_recommendations>["Prioritize testing admin.target.com for default creds",
                              "Enumerate dev-api.target.com API endpoints",
                              "Check staging.target.com for sensitive files"]</parameter>
+  <parameter=spawn_requests>[
+    {
+      "name": "Admin Panel Tester",
+      "task": "Test admin.target.com for default credentials and SQL injection",
+      "prompt_modules": "web_vuln_scanner,sql_injection"
+    },
+    {
+      "name": "API Scanner",
+      "task": "Scan dev-api.target.com for unauthenticated endpoints",
+      "prompt_modules": "api_scanner"
+    }
+  ]</parameter>
   </function>
     </examples>
   </tool>
