@@ -494,9 +494,24 @@ def check_docker_connection() -> Any:
         error_text.append("DOCKER NOT AVAILABLE", style="bold red")
         error_text.append("\n\n", style="white")
         error_text.append("Cannot connect to Docker daemon.\n", style="white")
-        error_text.append("Please ensure Docker is installed and running.\n\n", style="white")
-        error_text.append("Try running: ", style="dim white")
+        error_text.append(
+            "This is usually due to missing Docker permissions.\n\n", style="white"
+        )
+        error_text.append("To fix this, add your user to the docker group:\n\n", style="white")
+        error_text.append("  1. ", style="dim white")
+        error_text.append("sudo usermod -aG docker $USER", style="dim cyan")
+        error_text.append("\n", style="white")
+        error_text.append("  2. ", style="dim white")
+        error_text.append("newgrp docker", style="dim cyan")
+        error_text.append("\n\n", style="white")
+        error_text.append("Or ensure Docker daemon is running:\n", style="white")
+        error_text.append("  ", style="dim white")
         error_text.append("sudo systemctl start docker", style="dim cyan")
+        error_text.append("\n\n", style="white")
+        error_text.append(
+            "⚠️  Note: After adding to the docker group, you may need to log out and back in.",
+            style="dim yellow",
+        )
 
         panel = Panel(
             error_text,

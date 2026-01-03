@@ -69,6 +69,36 @@ class Tracer:
 
         return self._run_dir
 
+    def _write_agent_log(self, agent_id: str | None, role: str, content: str) -> None:
+        """Write agent messages to live log files for visibility during scan."""
+        try:
+            run_dir = self.get_run_dir()
+            logs_dir = run_dir / "logs"
+            logs_dir.mkdir(exist_ok=True)
+            
+            # Get agent name for filename
+            agent_name = "unknown"
+            if agent_id and agent_id in self.agents:
+                agent_name = self.agents[agent_id].get("name", agent_id)
+            elif agent_id:
+                agent_name = agent_id
+            
+            # Sanitize filename
+            safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in agent_name)
+            log_file = logs_dir / f"{safe_name}.log"
+            
+            timestamp = datetime.now(UTC).strftime("%H:%M:%S")
+            
+            # Truncate very long content for log readability
+            log_content = content[:2000] + "..." if len(content) > 2000 else content
+            
+            with log_file.open("a", encoding="utf-8") as f:
+                f.write(f"\n[{timestamp}] {role.upper()}:\n{log_content}\n")
+                f.write("-" * 80 + "\n")
+                
+        except Exception as e:
+            logger.warning(f"Failed to write agent log: {e}")
+
     def add_vulnerability_report(
         self,
         title: str,
@@ -148,11 +178,18 @@ class Tracer:
         }
 
         self.chat_messages.append(message_data)
+        
+        # Write to live log file for visibility
+        self._write_agent_log(agent_id, role, content)
         return message_id
 
     def log_tool_execution_start(self, agent_id: str, tool_name: str, args: dict[str, Any]) -> int:
         execution_id = self._next_execution_id
         self._next_execution_id += 1
+        
+        # Log tool call to agent's log file
+        args_summary = str(args)[:500] + "..." if len(str(args)) > 500 else str(args)
+        self._write_agent_log(agent_id, "TOOL_CALL", f"{tool_name}({args_summary})")
 
         now = datetime.now(UTC).isoformat()
         execution_data = {
@@ -178,9 +215,16 @@ class Tracer:
         self, execution_id: int, status: str, result: Any | None = None
     ) -> None:
         if execution_id in self.tool_executions:
-            self.tool_executions[execution_id]["status"] = status
-            self.tool_executions[execution_id]["result"] = result
-            self.tool_executions[execution_id]["completed_at"] = datetime.now(UTC).isoformat()
+            exec_data = self.tool_executions[execution_id]
+            exec_data["status"] = status
+            exec_data["result"] = result
+            exec_data["completed_at"] = datetime.now(UTC).isoformat()
+            
+            # Log tool result to agent's log file
+            agent_id = exec_data.get("agent_id")
+            tool_name = exec_data.get("tool_name", "unknown")
+            result_str = str(result)[:1000] + "..." if result and len(str(result)) > 1000 else str(result)
+            self._write_agent_log(agent_id, "TOOL_RESULT", f"{tool_name} -> {status}: {result_str}")
 
     def update_agent_status(
         self, agent_id: str, status: str, error_message: str | None = None

@@ -27,3 +27,11 @@ class AbstractRuntime(ABC):
     @abstractmethod
     async def destroy_sandbox(self, container_id: str) -> None:
         raise NotImplementedError
+
+    @abstractmethod
+    async def restart_tool_server(self, container_id: str) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    async def check_tool_server_health(self, container_id: str, port: int) -> bool:
+        raise NotImplementedError

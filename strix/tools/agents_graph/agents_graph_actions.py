@@ -1,9 +1,27 @@
+import logging
+import os
 import threading
+from collections import deque
 from datetime import UTC, datetime
 from typing import Any, Literal
 
 from strix.tools.registry import register_tool
 
+
+logger = logging.getLogger(__name__)
+
+# Agent concurrency control configuration
+# Set via environment variables or defaults
+MAX_CONCURRENT_AGENTS = int(os.getenv("STRIX_MAX_CONCURRENT_AGENTS", "3"))
+AGENT_SPAWN_DELAY = float(os.getenv("STRIX_AGENT_SPAWN_DELAY", "2.0"))  # seconds between spawns
+
+# Track actual running child agents (not root)
+_running_child_count = 0
+_running_child_lock = threading.Lock()
+
+# Queue for pending agents waiting to be spawned
+_pending_agents: deque[dict[str, Any]] = deque()
+_pending_lock = threading.Lock()
 
 _agent_graph: dict[str, Any] = {
     "nodes": {},
@@ -21,51 +39,198 @@ _agent_instances: dict[str, Any] = {}
 _agent_states: dict[str, Any] = {}
 
 
-def _run_agent_in_thread(
-    agent: Any, state: Any, inherited_messages: list[dict[str, Any]]
-) -> dict[str, Any]:
+def _summarize_context_with_llm(messages: list[dict[str, Any]]) -> str:
+    """Use LLM to intelligently summarize parent's conversation for child agent.
+    
+    This creates a focused briefing containing:
+    - Vulnerabilities and attack vectors discovered
+    - Key endpoints, URLs, and attack surface
+    - Credentials, tokens, or secrets found
+    - Current progress and what's been tried
+    - Dead ends to avoid duplicating work
+    """
+    if not messages:
+        return ""
+    
+    # Build conversation text from all messages
+    conversation_parts = []
+    
+    for msg in messages:
+        content = msg.get("content", "")
+        if not isinstance(content, str):
+            if isinstance(content, list):
+                # Handle multimodal content
+                text_parts = [item.get("text", "") for item in content if isinstance(item, dict) and item.get("type") == "text"]
+                content = "\n".join(text_parts)
+            else:
+                continue
+        
+        role = msg.get("role", "unknown")
+        msg_text = f"[{role}]: {content}\n"
+        conversation_parts.append(msg_text)
+    
+    if not conversation_parts:
+        return ""
+    
+    conversation_text = "".join(conversation_parts)
+    
+    # Use LLM to summarize
     try:
-        if inherited_messages:
-            state.add_message("user", "<inherited_context_from_parent>")
-            for msg in inherited_messages:
-                state.add_message(msg["role"], msg["content"])
-            state.add_message("user", "</inherited_context_from_parent>")
+        import litellm
+        
+        # Use the same model as agents - no hardcoded fallbacks
+        model = os.getenv("STRIX_LLM")
+        if not model:
+            logger.warning("STRIX_LLM not set, cannot summarize context")
+            return ""
+        
+        summary_prompt = f"""You are summarizing a security assessment conversation for a child agent.
 
-        parent_info = _agent_graph["nodes"].get(state.parent_id, {})
-        parent_name = parent_info.get("name", "Unknown Parent")
+Extract and condense ONLY the actionable intelligence into XML format:
 
-        context_status = (
-            "inherited conversation context from your parent for background understanding"
-            if inherited_messages
-            else "started with a fresh context"
+<context_summary>
+    <vulnerabilities>
+        <!-- List confirmed/suspected vulnerabilities with proof -->
+    </vulnerabilities>
+    <attack_surface>
+        <!-- Key endpoints, APIs, URLs discovered -->
+    </attack_surface>
+    <credentials>
+        <!-- Any tokens, passwords, API keys, secrets found -->
+    </credentials>
+    <progress>
+        <!-- What has been tested, current approach -->
+    </progress>
+    <dead_ends>
+        <!-- Failed attempts to avoid repeating -->
+    </dead_ends>
+</context_summary>
+
+Be concise but preserve critical technical details (exact URLs, parameters, payloads).
+Do NOT include raw tool output - summarize the findings.
+Output ONLY the XML, no markdown or other formatting.
+
+CONVERSATION:
+{conversation_text}
+
+XML SUMMARY:"""
+
+        response = litellm.completion(
+            model=model,
+            messages=[{"role": "user", "content": summary_prompt}],
+            timeout=30,
         )
+        
+        summary = response.choices[0].message.content or ""
+        logger.debug(f"LLM summarized {len(conversation_text)} chars to {len(summary)} chars")
+        return summary.strip()
+        
+    except Exception as e:
+        # If LLM fails for summarization, just pass empty context
+        # The child agent will start fresh - better than garbage extraction
+        # If the main LLM is down, the agent won't work anyway
+        logger.warning(f"LLM summarization failed: {e}. Child agent will start with fresh context.")
+        return ""
 
-        task_xml = f"""<agent_delegation>
-    <identity>
-        ⚠️ You are NOT your parent agent. You are a NEW, SEPARATE sub-agent (not root).
 
-        Your Info: {state.agent_name} ({state.agent_id})
-        Parent Info: {parent_name} ({state.parent_id})
-    </identity>
+def _release_agent_slot() -> None:
+    """Release a slot and process pending agents."""
+    global _running_child_count
+    
+    with _running_child_lock:
+        if _running_child_count > 0:
+            _running_child_count -= 1
+            logger.info(f"Released agent slot. Running: {_running_child_count}/{MAX_CONCURRENT_AGENTS}")
+    
+    _process_pending_agents()
 
-    <your_task>{state.task}</your_task>
 
-    <instructions>
-        - You have {context_status}
-        - Inherited context is for BACKGROUND ONLY - don't continue parent's work
-        - Maintain strict self-identity: never speak as or for your parent
-        - Do not merge your conversation with the parent's;
-        - Do not claim parent's actions or messages as your own
-        - Focus EXCLUSIVELY on your delegated task above
-        - Work independently with your own approach
-        - Use agent_finish when complete to report back to parent
-        - You are a SPECIALIST for this specific task
-        - You share the same container as other agents but have your own tool server instance
-        - All agents share /workspace directory and proxy history for better collaboration
-        - You can see files created by other agents and proxy traffic from previous work
-        - Build upon previous work but focus on your specific delegated task
-    </instructions>
-</agent_delegation>"""
+def _process_pending_agents() -> None:
+    """Process the pending agent queue, spawning agents as slots become available."""
+    global _running_child_count
+    import time
+    
+    from strix.agents import StrixAgent
+    
+    while True:
+        pending_info = None
+        current_count = 0
+        
+        # 1. Check capacity and pop from queue atomically
+        # We do NOT hold the lock while sleeping or starting threads
+        with _pending_lock:
+            if not _pending_agents:
+                break
+                
+            with _running_child_lock:
+                if _running_child_count >= MAX_CONCURRENT_AGENTS:
+                    logger.info(f"No agent slots available. Running: {_running_child_count}/{MAX_CONCURRENT_AGENTS}, Pending: {len(_pending_agents)}")
+                    break
+                
+                # Acquire slot BEFORE starting agent
+                _running_child_count += 1
+                current_count = _running_child_count
+            
+            # Only pop if we successfully acquired a slot
+            pending_info = _pending_agents.popleft()
+            
+        if not pending_info:
+            break
+            
+        # 2. Process the popped agent outside the locks
+        try:
+            logger.info(f"Starting pending agent: {pending_info['name']} (Running: {current_count}/{MAX_CONCURRENT_AGENTS})")
+            
+            # Add delay between spawns to avoid overwhelming target
+            if AGENT_SPAWN_DELAY > 0:
+                time.sleep(AGENT_SPAWN_DELAY)
+            
+            # NOW create the StrixAgent - this adds it to graph with status="running"
+            agent_config = pending_info["agent_config"]
+            state = pending_info["state"]
+            agent = StrixAgent(agent_config)
+            _agent_instances[state.agent_id] = agent
+            
+            # Start the agent thread
+            thread = threading.Thread(
+                target=_run_agent_in_thread,
+                args=(agent, state, pending_info["context_summary"]),
+                daemon=True,
+                name=f"Agent-{pending_info['name']}-{state.agent_id}",
+            )
+            thread.start()
+            _running_agents[state.agent_id] = thread
+            
+        except Exception as e:
+            logger.error(f"Failed to start pending agent {pending_info['name']}: {e}")
+            # CRITICAL: Release the slot we reserved since we failed to start
+            with _running_child_lock:
+                _running_child_count -= 1
+            
+            # Mark as failed in graph if it was added
+            state = pending_info["state"]
+            if state.agent_id in _agent_graph["nodes"]:
+                _agent_graph["nodes"][state.agent_id]["status"] = "failed"
+                _agent_graph["nodes"][state.agent_id]["result"] = {"error": str(e)}
+                _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
+
+
+def _run_agent_in_thread(
+    agent: Any, state: Any, context_summary: str
+) -> dict[str, Any]:
+    """Run an agent in a thread with compressed context instead of full history."""
+    try:
+        # Add compressed context summary from parent (if any)
+        if context_summary:
+            state.add_message("user", f"""<parent_context>
+{context_summary}
+</parent_context>""")
+
+        # Add task assignment - identity is handled by LLM._build_identity_message()
+        task_xml = f"""<task_assignment>
+    <delegated_task>{state.task}</delegated_task>
+    <parent_id>{state.parent_id}</parent_id>
+</task_assignment>"""
 
         state.add_message("user", task_xml)
 
@@ -88,6 +253,8 @@ def _run_agent_in_thread(
         _agent_graph["nodes"][state.agent_id]["result"] = {"error": str(e)}
         _running_agents.pop(state.agent_id, None)
         _agent_instances.pop(state.agent_id, None)
+        # Release slot for next pending agent
+        _release_agent_slot()
         raise
     else:
         if state.stop_requested:
@@ -98,6 +265,8 @@ def _run_agent_in_thread(
         _agent_graph["nodes"][state.agent_id]["result"] = result
         _running_agents.pop(state.agent_id, None)
         _agent_instances.pop(state.agent_id, None)
+        # Release slot for next pending agent
+        _release_agent_slot()
 
         return {"result": result}
 
@@ -163,6 +332,10 @@ def view_agent_graph(agent_state: Any) -> dict[str, Any]:
         failed_count = sum(
             1 for node in _agent_graph["nodes"].values() if node["status"] in ["failed", "error"]
         )
+        queued_count = sum(
+            1 for node in _agent_graph["nodes"].values() if node["status"] == "queued"
+        )
+        pending_in_queue = len(_pending_agents)
 
     except Exception as e:  # noqa: BLE001
         return {
@@ -170,11 +343,19 @@ def view_agent_graph(agent_state: Any) -> dict[str, Any]:
             "graph_structure": "Error retrieving graph structure",
         }
     else:
+        with _running_child_lock:
+            actual_running = _running_child_count
         return {
             "graph_structure": graph_structure,
+            "concurrency_info": {
+                "max_concurrent_agents": MAX_CONCURRENT_AGENTS,
+                "currently_running": actual_running,
+                "pending_in_queue": pending_in_queue,
+            },
             "summary": {
                 "total_agents": total_nodes,
                 "running": running_count,
+                "queued": queued_count,
                 "waiting": waiting_count,
                 "stopping": stopping_count,
                 "completed": completed_count,
@@ -193,6 +374,19 @@ def create_agent(
     prompt_modules: str | None = None,
 ) -> dict[str, Any]:
     try:
+        # Enforce hierarchy: Only Root Agent (or agents with no parent) can spawn new agents directly.
+        # Sub-agents must request spawns via agent_finish.
+        if hasattr(agent_state, "parent_id") and agent_state.parent_id is not None:
+             return {
+                "success": False,
+                "error": (
+                    "PERMISSION DENIED: Sub-agents are NOT allowed to spawn new agents directly. "
+                    "You must complete your current task and request new agents via the 'agent_finish' tool. "
+                    "Use the 'spawn_requests' parameter in 'agent_finish' to specify the agents you want to create."
+                ),
+                "agent_id": None,
+            }
+
         parent_id = agent_state.agent_id
 
         module_list = []
@@ -224,9 +418,14 @@ def create_agent(
                     "agent_id": None,
                 }
 
-        from strix.agents import StrixAgent
         from strix.agents.state import AgentState
         from strix.llm.config import LLMConfig
+        import uuid
+
+        # Prepare state and config BEFORE checking concurrency
+        # DO NOT create StrixAgent yet - it adds to graph with status="running"
+        if not name:
+            name = f"Agent-{uuid.uuid4().hex[:6]}"
 
         state = AgentState(task=task, agent_name=name, parent_id=parent_id, max_iterations=300)
 
@@ -249,22 +448,86 @@ def create_agent(
         if parent_agent and hasattr(parent_agent, "non_interactive"):
             agent_config["non_interactive"] = parent_agent.non_interactive
 
-        agent = StrixAgent(agent_config)
-
-        inherited_messages = []
+        # Summarize context using LLM BEFORE deciding to queue or start
+        context_summary = ""
         if inherit_context:
-            inherited_messages = agent_state.get_conversation_history()
+            parent_messages = agent_state.get_conversation_history()
+            context_summary = _summarize_context_with_llm(parent_messages)
+            logger.debug(f"Summarized {len(parent_messages)} messages to {len(context_summary)} chars for child agent")
 
-        _agent_instances[state.agent_id] = agent
-
-        thread = threading.Thread(
-            target=_run_agent_in_thread,
-            args=(agent, state, inherited_messages),
-            daemon=True,
-            name=f"Agent-{name}-{state.agent_id}",
-        )
-        thread.start()
-        _running_agents[state.agent_id] = thread
+        # Check if we have capacity to start immediately
+        global _running_child_count
+        
+        can_start = False
+        current_count = 0
+        
+        with _running_child_lock:
+            if _running_child_count < MAX_CONCURRENT_AGENTS:
+                _running_child_count += 1
+                can_start = True
+            current_count = _running_child_count
+        
+        if can_start:
+            try:
+                # Now create and start the agent - this adds it to graph with status="running"
+                from strix.agents import StrixAgent
+                agent = StrixAgent(agent_config)
+                _agent_instances[state.agent_id] = agent
+                
+                logger.info(f"Starting agent '{name}' immediately (Running: {current_count}/{MAX_CONCURRENT_AGENTS})")
+                thread = threading.Thread(
+                    target=_run_agent_in_thread,
+                    args=(agent, state, context_summary),
+                    daemon=True,
+                    name=f"Agent-{name}-{state.agent_id}",
+                )
+                thread.start()
+                _running_agents[state.agent_id] = thread
+                spawn_status = "started"
+            except Exception as e:
+                # CRITICAL: Release the slot if startup fails
+                with _running_child_lock:
+                    _running_child_count -= 1
+                
+                # Mark as failed in graph if it was added
+                if state.agent_id in _agent_graph["nodes"]:
+                    _agent_graph["nodes"][state.agent_id]["status"] = "failed"
+                    _agent_graph["nodes"][state.agent_id]["result"] = {"error": str(e)}
+                    _agent_graph["nodes"][state.agent_id]["finished_at"] = datetime.now(UTC).isoformat()
+                
+                raise
+        else:
+            # Queue the agent config for later - do NOT create StrixAgent yet
+            pending_count = len(_pending_agents)
+            logger.info(f"Queueing agent '{name}' (Running: {current_count}/{MAX_CONCURRENT_AGENTS}, Pending: {pending_count})")
+            with _pending_lock:
+                _pending_agents.append({
+                    "agent_config": agent_config,  # Config, not instance
+                    "state": state,
+                    "name": name,
+                    "context_summary": context_summary,
+                })
+            
+            # Add placeholder to graph so it's visible in UI immediately
+            _agent_graph["nodes"][state.agent_id] = {
+                "id": state.agent_id,
+                "name": name,
+                "task": task,
+                "status": "queued",
+                "parent_id": parent_id,
+                "created_at": datetime.now(UTC).isoformat(),
+                "finished_at": None,
+                "result": None,
+                "llm_config": "pending",
+                "agent_type": "StrixAgent",
+                "state": state.model_dump(),
+            }
+            
+            # Double check if we can process now (race condition fix)
+            # A slot might have opened up between our check and the append
+            _process_pending_agents()
+            
+            spawn_status = "queued"
 
     except Exception as e:  # noqa: BLE001
         return {"success": False, "error": f"Failed to create agent: {e}", "agent_id": None}
@@ -272,11 +535,13 @@ def create_agent(
         return {
             "success": True,
             "agent_id": state.agent_id,
-            "message": f"Agent '{name}' created and started asynchronously",
+            "message": f"Agent '{name}' {spawn_status} (max {MAX_CONCURRENT_AGENTS} concurrent agents)",
+            "spawn_status": spawn_status,
+            "pending_count": len(_pending_agents),
             "agent_info": {
                 "id": state.agent_id,
                 "name": name,
-                "status": "running",
+                "status": "running" if spawn_status == "started" else "queued",
                 "parent_id": parent_id,
             },
         }
@@ -361,7 +626,45 @@ def agent_finish(
     success: bool = True,
     report_to_parent: bool = True,
     final_recommendations: list[str] | None = None,
+    spawn_requests: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """Complete agent execution and report summarized findings back to parent.
+    
+    CRITICAL: You must SUMMARIZE your findings, not dump raw tool output!
+    
+    Your job is to distill your work into actionable intelligence:
+    
+    result_summary: A concise paragraph explaining what you found and accomplished.
+                   Focus on the key takeaways, not a play-by-play.
+    
+    findings: List of discrete, actionable findings. Each should be:
+              - One specific item (vulnerability, endpoint, credential, etc.)
+              - Include proof/evidence inline (URL, parameter, payload)
+              - Summarized, not raw output
+              
+              BAD:  "nmap output: PORT STATE SERVICE VERSION\\n22/tcp open ssh..."
+              GOOD: "OpenSSH 8.2p1 on port 22 - vulnerable to CVE-2020-15778"
+              
+              BAD:  "Found the following endpoints: /api/users, /api/admin, /api/..."
+              GOOD: "Unauthenticated admin API at /api/admin/users returns user list"
+    
+    final_recommendations: Prioritized next steps for parent/other agents.
+
+    spawn_requests: List of agents you recommend spawning to investigate findings further.
+                    Each request should be a dictionary with:
+                    - name: str (Name of the agent)
+                    - task: str (Detailed task description)
+                    - prompt_modules: str (Optional, comma-separated list of modules)
+                    
+                    Example:
+                    [
+                        {
+                            "name": "NPM Vulnerability Agent",
+                            "task": "Investigate Nginx Proxy Manager on port 81...",
+                            "prompt_modules": "web_vuln_scanner"
+                        }
+                    ]
+    """
     try:
         if not hasattr(agent_state, "parent_id") or agent_state.parent_id is None:
             return {
@@ -380,6 +683,7 @@ def agent_finish(
 
         agent_node = _agent_graph["nodes"][agent_id]
 
+        # Store findings as-is (agent is responsible for summarizing)
         agent_node["status"] = "finished" if success else "failed"
         agent_node["finished_at"] = datetime.now(UTC).isoformat()
         agent_node["result"] = {
@@ -387,6 +691,7 @@ def agent_finish(
             "findings": findings or [],
             "success": success,
             "recommendations": final_recommendations or [],
+            "spawn_requests": spawn_requests or [],
         }
 
         parent_notified = False
@@ -395,6 +700,7 @@ def agent_finish(
             parent_id = agent_node["parent_id"]
 
             if parent_id in _agent_graph["nodes"]:
+                # Build findings XML
                 findings_xml = "\n".join(
                     f"        <finding>{finding}</finding>" for finding in (findings or [])
                 )
@@ -402,6 +708,18 @@ def agent_finish(
                     f"        <recommendation>{rec}</recommendation>"
                     for rec in (final_recommendations or [])
                 )
+                
+                spawn_requests_xml = ""
+                if spawn_requests:
+                    spawn_requests_xml = "        <spawn_requests>\n"
+                    for req in spawn_requests:
+                        spawn_requests_xml += "            <request>\n"
+                        spawn_requests_xml += f"                <name>{req.get('name', 'Unknown')}</name>\n"
+                        spawn_requests_xml += f"                <task>{req.get('task', '')}</task>\n"
+                        if req.get('prompt_modules'):
+                            spawn_requests_xml += f"                <prompt_modules>{req.get('prompt_modules')}</prompt_modules>\n"
+                        spawn_requests_xml += "            </request>\n"
+                    spawn_requests_xml += "        </spawn_requests>"
 
                 report_message = f"""<agent_completion_report>
     <agent_info>
@@ -409,7 +727,6 @@ def agent_finish(
         <agent_id>{agent_id}</agent_id>
         <task>{agent_node["task"]}</task>
         <status>{"SUCCESS" if success else "FAILED"}</status>
-        <completion_time>{agent_node["finished_at"]}</completion_time>
     </agent_info>
     <results>
         <summary>{result_summary}</summary>
@@ -419,6 +736,7 @@ def agent_finish(
         <recommendations>
 {recommendations_xml}
         </recommendations>
+{spawn_requests_xml}
     </results>
 </agent_completion_report>"""
 
