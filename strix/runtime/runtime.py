@@ -35,3 +35,19 @@ class AbstractRuntime(ABC):
     @abstractmethod
     async def check_tool_server_health(self, container_id: str, port: int) -> bool:
         raise NotImplementedError
+
+    @abstractmethod
+    async def cleanup_resources(self, run_id: str | None = None) -> None:
+        """
+        Cleanup resources associated with the runtime.
+        If run_id is provided, cleanup resources for that specific run.
+        Otherwise, perform a general cleanup of stale resources.
+        """
+        raise NotImplementedError
+
+    @abstractmethod
+    async def get_strix_containers(self, exclude_run_id: str | None = None) -> list[str]:
+        """
+        Get a list of active Strix container IDs/names.
+        """
+        raise NotImplementedError

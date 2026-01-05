@@ -33,6 +33,7 @@ from strix.interface.utils import (
     validate_llm_response,
 )
 from strix.runtime.docker_runtime import STRIX_IMAGE
+from strix.runtime import get_runtime
 from strix.telemetry.tracer import get_global_tracer
 
 
@@ -547,10 +548,33 @@ def main() -> None:
 
     args.local_sources = collect_local_sources(args.targets_info)
 
-    if args.non_interactive:
-        asyncio.run(run_cli(args))
-    else:
-        asyncio.run(run_tui(args))
+    try:
+        if args.non_interactive:
+            asyncio.run(run_cli(args))
+        else:
+            asyncio.run(run_tui(args))
+    finally:
+        # Cleanup resources
+        console = Console()
+        console.print("[bold yellow]Cleaning up Docker resources for current session...[/]")
+        try:
+            runtime = get_runtime()
+            # 1. Clean up current session
+            asyncio.run(runtime.cleanup_resources(args.run_name))
+            
+            # 2. Check for other containers and prompt
+            other_containers = asyncio.run(runtime.get_strix_containers(exclude_run_id=args.run_name))
+            if other_containers:
+                from rich.prompt import Confirm
+                console.print(f"\n[bold orange1]Found {len(other_containers)} other Strix containers from previous sessions.[/]")
+                if Confirm.ask("Do you want to clean them up?"):
+                    console.print("[bold yellow]Cleaning up all remaining Strix containers...[/]")
+                    asyncio.run(runtime.cleanup_resources(run_id=None))
+                    console.print("[bold green]Cleanup complete.[/]")
+                else:
+                    console.print("[dim]Skipping cleanup of other containers.[/]")
+        except Exception as e:
+            console.print(f"[bold red]Error during cleanup: {e}[/]")
 
     results_path = Path("strix_runs") / args.run_name
     display_completion_message(args, results_path)

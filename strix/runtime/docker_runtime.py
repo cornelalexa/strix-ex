@@ -457,3 +457,52 @@ class DockerRuntime(AbstractRuntime):
                 return response.status_code == 200
         except Exception:
             return False
+
+    async def cleanup_resources(self, run_id: str | None = None) -> None:
+        logger.info("Starting Docker resource cleanup...")
+        try:
+            # List all containers with the strix-scan-id label
+            containers = self.client.containers.list(
+                all=True, filters={"label": "strix-scan-id"}
+            )
+
+            for container in containers:
+                scan_id = container.labels.get("strix-scan-id")
+                should_remove = False
+
+                if run_id:
+                    # If run_id is provided, ONLY remove containers for this run
+                    if scan_id == run_id:
+                        should_remove = True
+                else:
+                    # If no run_id provided, remove ALL Strix containers
+                    should_remove = True
+
+                if should_remove:
+                    try:
+                        logger.info(f"Removing container {container.name} ({container.id})")
+                        if container.status == "running":
+                            container.stop(timeout=1)
+                        container.remove(force=True)
+                    except Exception as e:
+                        logger.warning(f"Failed to remove container {container.name}: {e}")
+
+        except Exception as e:
+            logger.error(f"Error during Docker cleanup: {e}")
+
+    async def get_strix_containers(self, exclude_run_id: str | None = None) -> list[str]:
+        try:
+            containers = self.client.containers.list(
+                all=True, filters={"label": "strix-scan-id"}
+            )
+            results = []
+            for container in containers:
+                scan_id = container.labels.get("strix-scan-id")
+                if exclude_run_id and scan_id == exclude_run_id:
+                    continue
+                results.append(container.name)
+            return results
+        except Exception as e:
+            logger.error(f"Error listing Strix containers: {e}")
+            return []
+
