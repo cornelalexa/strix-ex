@@ -10,6 +10,7 @@ from typing import cast
 import docker
 from docker.errors import DockerException, ImageNotFound, NotFound
 from docker.models.containers import Container
+from docker.models.images import Image
 
 from .runtime import AbstractRuntime, SandboxInfo
 
@@ -53,7 +54,7 @@ class DockerRuntime(AbstractRuntime):
         return f"scan-{agent_id.split('-')[0]}"
 
     def _verify_image_available(self, image_name: str, max_retries: int = 3) -> None:
-        def _validate_image(image: docker.models.images.Image) -> None:
+        def _validate_image(image: Image) -> None:
             if not image.id or not image.attrs:
                 raise ImageNotFound(f"Image {image_name} metadata incomplete")
 
