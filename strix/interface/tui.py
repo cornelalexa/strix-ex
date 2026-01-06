@@ -503,8 +503,9 @@ class StrixTUIApp(App):  # type: ignore[misc]
                 "waiting": "⏸️",
                 "completed": "✅",
                 "failed": "❌",
-                "stopped": "⏹️",
+                "stopped": "💀",
                 "stopping": "⏸️",
+                "terminating": "💀",
                 "llm_failed": "🔴",
             }
 
@@ -867,8 +868,9 @@ class StrixTUIApp(App):  # type: ignore[misc]
             "waiting": "🟡",
             "completed": "✅",
             "failed": "❌",
-            "stopped": "⏹️",
+            "stopped": "💀",
             "stopping": "⏸️",
+            "terminating": "💀",
         }
 
         status_icon = status_indicators.get(status, "🔵")
@@ -935,8 +937,9 @@ class StrixTUIApp(App):  # type: ignore[misc]
             "waiting": "🟡",
             "completed": "✅",
             "failed": "❌",
-            "stopped": "⏹️",
+            "stopped": "💀",
             "stopping": "⏸️",
+            "terminating": "💀",
         }
 
         status_icon = status_indicators.get(status, "🔵")

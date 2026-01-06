@@ -121,3 +121,29 @@ class WaitForMessageRenderer(BaseToolRenderer):
 
         css_classes = cls.get_css_classes("completed")
         return Static(content_text, classes=css_classes)
+
+
+@register_tool_renderer
+class ManageAgentRenderer(BaseToolRenderer):
+    tool_name: ClassVar[str] = "manage_agent"
+    css_classes: ClassVar[list[str]] = ["tool-call", "agents-graph-tool"]
+
+    @classmethod
+    def render(cls, tool_data: dict[str, Any]) -> Static:
+        args = tool_data.get("args", {})
+        agent_id = args.get("agent_id", "unknown")
+        action = args.get("action", "unknown")
+        reason = args.get("reason", "")
+
+        icon = "💀" if action == "terminate" else "🔍"
+        color = "#ef4444" if action == "terminate" else "#fbbf24"
+
+        header = f"{icon} [bold {color}]{action.title()} Agent {agent_id}[/]"
+
+        if reason:
+            content_text = f"{header}\n  [dim]Reason: {cls.escape_markup(reason)}[/]"
+        else:
+            content_text = header
+
+        css_classes = cls.get_css_classes("completed")
+        return Static(content_text, classes=css_classes)
