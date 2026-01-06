@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import logging
 import os
+import queue as pyqueue
 import signal
 import sys
 from multiprocessing import Process, Queue
@@ -106,7 +107,20 @@ def agent_worker(_agent_id: str, request_queue: Queue[Any], response_queue: Queu
 
 
 def ensure_agent_process(agent_id: str) -> tuple[Queue[Any], Queue[Any]]:
-    if agent_id not in agent_processes:
+    restart = False
+    if agent_id in agent_processes:
+        process_info = agent_processes[agent_id]
+        if not process_info["process"].is_alive():
+            logging.warning(f"Agent process {agent_id} (PID {process_info['pid']}) is dead. Restarting...")
+            # Clean up old queues
+            try:
+                agent_queues[agent_id]["request"].close()
+                agent_queues[agent_id]["response"].close()
+            except Exception:
+                pass
+            restart = True
+    
+    if agent_id not in agent_processes or restart:
         request_queue: Queue[Any] = Queue()
         response_queue: Queue[Any] = Queue()
 
@@ -121,6 +135,22 @@ def ensure_agent_process(agent_id: str) -> tuple[Queue[Any], Queue[Any]]:
     return agent_queues[agent_id]["request"], agent_queues[agent_id]["response"]
 
 
+def get_response_with_monitoring(response_queue: Queue[Any], agent_id: str) -> Any:
+    """Get response from queue while monitoring the agent process health."""
+    while True:
+        try:
+            return response_queue.get(timeout=0.5)
+        except pyqueue.Empty:
+            # Check if process is alive
+            if agent_id in agent_processes:
+                proc = agent_processes[agent_id]["process"]
+                if not proc.is_alive():
+                    return {"error": f"Agent process died unexpectedly (exit code: {proc.exitcode})"}
+            else:
+                return {"error": "Agent process not found"}
+            # Continue waiting
+
+
 @app.post("/execute", response_model=ToolExecutionResponse)
 async def execute_tool(
     request: ToolExecutionRequest, credentials: HTTPAuthorizationCredentials = security_dependency
@@ -133,7 +163,10 @@ async def execute_tool(
 
     try:
         loop = asyncio.get_event_loop()
-        response = await loop.run_in_executor(None, response_queue.get)
+        # Use the monitoring function in the executor
+        response = await loop.run_in_executor(
+            None, get_response_with_monitoring, response_queue, request.agent_id
+        )
 
         if "error" in response:
             return ToolExecutionResponse(error=response["error"])

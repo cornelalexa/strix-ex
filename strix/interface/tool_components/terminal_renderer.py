@@ -52,14 +52,16 @@ class TerminalRenderer(BaseToolRenderer):
     def render(cls, tool_data: dict[str, Any]) -> Static:
         args = tool_data.get("args", {})
         status = tool_data.get("status", "unknown")
-        result = tool_data.get("result", {})
+        result_raw = tool_data.get("result")
+        result = result_raw if isinstance(result_raw, dict) else {}
 
         command = args.get("command", "")
         is_input = args.get("is_input", False)
         terminal_id = args.get("terminal_id", "default")
         timeout = args.get("timeout")
+        running_command = result.get("running_command")
 
-        content = cls._build_sleek_content(command, is_input, terminal_id, timeout, result)
+        content = cls._build_sleek_content(command, is_input, terminal_id, timeout, result, running_command)
 
         css_classes = cls.get_css_classes(status)
         return Static(content, classes=css_classes)
@@ -72,11 +74,14 @@ class TerminalRenderer(BaseToolRenderer):
         terminal_id: str,  # noqa: ARG003
         timeout: float | None,  # noqa: ARG003
         result: dict[str, Any],  # noqa: ARG003
+        running_command: str | None = None,
     ) -> str:
         terminal_icon = ">_"
 
         if not command.strip():
-            return f"{terminal_icon} [dim]getting logs...[/]"
+            if running_command:
+                return f"{terminal_icon} [dim]Terminal active (waiting for: {running_command})[/]"
+            return f"{terminal_icon} [dim]Terminal active (waiting for output)[/]"
 
         control_sequences = {
             "C-c",

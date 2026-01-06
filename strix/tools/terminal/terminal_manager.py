@@ -40,6 +40,7 @@ class TerminalManager:
                 "status": result["status"],
                 "exit_code": result.get("exit_code"),
                 "working_dir": result.get("working_dir"),
+                "running_command": result.get("running_command"),
             }
 
         except RuntimeError as e:

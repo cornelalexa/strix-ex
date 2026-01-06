@@ -41,6 +41,7 @@ class TerminalSession:
 
         self.prev_status: BashCommandStatus | None = None
         self.prev_output: str = ""
+        self.last_command: str = ""
         self._initialized = False
 
         self.initialize()
@@ -220,7 +221,23 @@ class TerminalSession:
         last_pane_output = cur_pane_output
 
         while True:
-            cur_pane_output = self._get_pane_content()
+            try:
+                cur_pane_output = self._get_pane_content()
+            except Exception as e:
+                if not self.is_running():
+                    return {
+                        "content": f"Terminal session crashed during execution: {e}",
+                        "status": "error",
+                        "exit_code": None,
+                        "working_dir": self._cwd,
+                    }
+                return {
+                    "content": f"Failed to read terminal output: {e}",
+                    "status": "error",
+                    "exit_code": None,
+                    "working_dir": self._cwd,
+                }
+
             ps1_matches = self._matches_ps1_metadata(cur_pane_output)
 
             if cur_pane_output.rstrip().endswith(self.PS1_END.rstrip()) or len(ps1_matches) > 0:
@@ -251,6 +268,7 @@ class TerminalSession:
                     "status": "running",
                     "exit_code": None,
                     "working_dir": self._cwd,
+                    "running_command": self.last_command,
                 }
 
             if cur_pane_output != last_pane_output:
@@ -277,7 +295,23 @@ class TerminalSession:
         self.pane.send_keys(command, enter=should_add_enter)
 
         time.sleep(2)
-        cur_pane_output = self._get_pane_content()
+        try:
+            cur_pane_output = self._get_pane_content()
+        except Exception as e:
+            if not self.is_running():
+                return {
+                    "content": f"Terminal session crashed during execution: {e}",
+                    "status": "error",
+                    "exit_code": None,
+                    "working_dir": self._cwd,
+                }
+            return {
+                "content": f"Failed to read terminal output: {e}",
+                "status": "error",
+                "exit_code": None,
+                "working_dir": self._cwd,
+            }
+
         ps1_matches = self._matches_ps1_metadata(cur_pane_output)
         raw_command_output = self._combine_outputs_between_matches(cur_pane_output, ps1_matches)
         command_output = self._get_command_output(command, raw_command_output)
@@ -292,6 +326,7 @@ class TerminalSession:
                 "status": "running",
                 "exit_code": None,
                 "working_dir": self._cwd,
+                "running_command": self.last_command,
             }
 
         exit_code = self._extract_exit_code_from_matches(ps1_matches)
@@ -316,12 +351,32 @@ class TerminalSession:
         start_time = time.time()
         last_pane_output = initial_pane_output
 
+        self.last_command = command
         is_special_key = self._is_special_key(command)
         should_add_enter = not is_special_key and not no_enter
         self.pane.send_keys(command, enter=should_add_enter)
 
         while True:
-            cur_pane_output = self._get_pane_content()
+            try:
+                cur_pane_output = self._get_pane_content()
+            except Exception as e:
+                if not self.is_running():
+                    return {
+                        "content": f"Terminal session crashed during execution: {e}",
+                        "status": "error",
+                        "exit_code": None,
+                        "working_dir": self._cwd,
+                    }
+                # If running but failed to read, maybe transient?
+                # But usually _get_pane_content fails if tmux is dead.
+                # We'll assume it's a fatal error for this command.
+                return {
+                    "content": f"Failed to read terminal output during execution: {e}",
+                    "status": "error",
+                    "exit_code": None,
+                    "working_dir": self._cwd,
+                }
+
             ps1_matches = self._matches_ps1_metadata(cur_pane_output)
             current_ps1_count = len(ps1_matches)
 
@@ -373,6 +428,7 @@ class TerminalSession:
                     "status": "running",
                     "exit_code": None,
                     "working_dir": self._cwd,
+                    "running_command": self.last_command,
                 }
 
             time.sleep(self.POLL_INTERVAL)
@@ -383,7 +439,24 @@ class TerminalSession:
         if not self._initialized:
             raise RuntimeError("Bash session is not initialized")
 
-        cur_pane_output = self._get_pane_content()
+        if not self.is_running():
+             return {
+                "content": "Terminal session is not running (crashed or closed).",
+                "status": "error",
+                "exit_code": None,
+                "working_dir": self._cwd,
+            }
+
+        try:
+            cur_pane_output = self._get_pane_content()
+        except Exception as e:
+            return {
+                "content": f"Failed to read terminal output: {e}",
+                "status": "error",
+                "exit_code": None,
+                "working_dir": self._cwd,
+            }
+
         ps1_matches = self._matches_ps1_metadata(cur_pane_output)
         is_command_running = not (
             cur_pane_output.rstrip().endswith(self.PS1_END.rstrip()) or len(ps1_matches) > 0
