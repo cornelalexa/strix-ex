@@ -178,8 +178,19 @@ async def warm_up_llm() -> None:
     console = Console()
 
     try:
+        from strix.llm.llm import _refresh_github_copilot_token_if_needed, _get_github_copilot_token
+
         model_name = os.getenv("STRIX_LLM", "openai/gpt-5")
+
+        # Refresh GitHub Copilot token if needed (before loading api_key)
+        _refresh_github_copilot_token_if_needed(model_name)
+
         api_key = os.getenv("LLM_API_KEY")
+
+        # If using Copilot and no env key, try to get from config
+        if not api_key and model_name and "github" in model_name.lower() and "copilot" in model_name.lower():
+            api_key = _get_github_copilot_token()
+
         api_base = (
             os.getenv("LLM_API_BASE")
             or os.getenv("OPENAI_API_BASE")
@@ -211,7 +222,29 @@ async def warm_up_llm() -> None:
                 "Copilot-Integration-Id": "vscode-chat",
             }
 
-        response = litellm.completion(**completion_kwargs)
+        try:
+            response = litellm.completion(**completion_kwargs)
+        except Exception as e:
+            # Check for authentication errors (401) and retry for Copilot
+            is_auth_error = False
+            if hasattr(e, "status_code") and e.status_code == 401:
+                is_auth_error = True
+            elif hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 401:
+                is_auth_error = True
+            elif "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
+                is_auth_error = True
+
+            if is_auth_error and model_name and "github" in model_name.lower() and "copilot" in model_name.lower():
+                console.print("[yellow]Authentication failed. Refreshing GitHub Copilot token...[/]")
+                _refresh_github_copilot_token_if_needed(model_name, force=True)
+
+                new_token = _get_github_copilot_token()
+                if new_token:
+                    completion_kwargs["api_key"] = new_token
+
+                response = litellm.completion(**completion_kwargs)
+            else:
+                raise e
 
         validate_llm_response(response)
 

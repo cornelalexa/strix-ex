@@ -39,7 +39,7 @@ _LLM_API_BASE = (
 )
 
 
-def _refresh_github_copilot_token_if_needed(model_name: str | None) -> None:
+def _refresh_github_copilot_token_if_needed(model_name: str | None, force: bool = False) -> None:
     """Refresh GitHub Copilot API key before it expires using the access token."""
     if not model_name or "github" not in model_name.lower() or "copilot" not in model_name.lower():
         return
@@ -48,67 +48,93 @@ def _refresh_github_copilot_token_if_needed(model_name: str | None) -> None:
     api_key_file = copilot_config_dir / "api-key.json"
     access_token_file = copilot_config_dir / "access-token"
 
-    if not api_key_file.exists() or not access_token_file.exists():
+    if not access_token_file.exists():
         return
 
-    try:
-        with open(api_key_file) as f:
-            api_key_data = json.load(f)
+    time_until_expiry = 0
+    api_key_data = {}
 
-        expires_at = api_key_data.get("expires_at", 0)
-        current_time = time.time()
-        time_until_expiry = expires_at - current_time
+    if api_key_file.exists():
+        try:
+            with open(api_key_file) as f:
+                api_key_data = json.load(f)
+            expires_at = api_key_data.get("expires_at", 0)
+            current_time = time.time()
+            time_until_expiry = expires_at - current_time
+        except Exception:
+            time_until_expiry = -1
+    else:
+        time_until_expiry = -1
 
-        # Refresh if token expires in less than 5 minutes
-        if time_until_expiry < 300:
-            logger.info(
-                f"GitHub Copilot API key expiring in {max(0, time_until_expiry / 60):.0f} minutes. "
-                "Refreshing using access token..."
+    # Refresh if token expires in less than 5 minutes or forced
+    if force or time_until_expiry < 300:
+        reason = "forced" if force else ("missing/expired" if time_until_expiry < 0 else f"expiring in {max(0, time_until_expiry / 60):.0f} minutes")
+        logger.info(f"Refreshing GitHub Copilot API key ({reason})...")
+
+        # Read the access token
+        with open(access_token_file) as f:
+            access_token = f.read().strip()
+
+        if not access_token:
+            logger.warning("No access token available. Clearing cache.")
+            import shutil
+            shutil.rmtree(copilot_config_dir, ignore_errors=True)
+            return
+
+        try:
+            import requests
+
+            # Use the access token to get a fresh API key from GitHub
+            response = requests.get(
+                "https://api.github.com/copilot_internal/v2/token",
+                headers={
+                    "Authorization": f"token {access_token}",
+                    "Accept": "application/json",
+                    "Editor-Version": "vscode/1.85.1",
+                    "Editor-Plugin-Version": "copilot/1.155.0",
+                    "User-Agent": "GithubCopilot/1.155.0",
+                },
+                timeout=10,
             )
 
-            # Read the access token
-            with open(access_token_file) as f:
-                access_token = f.read().strip()
+            if response.status_code == 200:
+                new_api_key_data = response.json()
+                # Update the api-key.json with new expiration
+                api_key_data.update(new_api_key_data)
+                api_key_data["expires_at"] = int(time.time()) + new_api_key_data.get("expires_in", 28800)
 
-            if not access_token:
-                logger.warning("No access token available. Clearing cache.")
-                import shutil
-                shutil.rmtree(copilot_config_dir, ignore_errors=True)
-                return
+                with open(api_key_file, "w") as f:
+                    json.dump(api_key_data, f)
 
-            try:
-                import requests
-
-                # Use the access token to get a fresh API key from GitHub
-                response = requests.get(
-                    "https://api.github.com/copilot_internal/v2/token",
-                    headers={
-                        "Authorization": f"token {access_token}",
-                        "Accept": "application/json",
-                    },
-                    timeout=10,
-                )
-
-                if response.status_code == 200:
-                    new_api_key_data = response.json()
-                    # Update the api-key.json with new expiration
-                    api_key_data.update(new_api_key_data)
-                    api_key_data["expires_at"] = int(time.time()) + new_api_key_data.get("expires_in", 28800)
-
-                    with open(api_key_file, "w") as f:
-                        json.dump(api_key_data, f)
-
-                    logger.info("GitHub Copilot API key refreshed successfully")
-                else:
-                    logger.warning(f"API key refresh failed ({response.status_code}). Clearing cache...")
+                logger.info("GitHub Copilot API key refreshed successfully")
+            else:
+                logger.warning(f"API key refresh failed ({response.status_code}).")
+                if response.status_code == 401:
+                    logger.warning("Access token invalid. Clearing all cache.")
                     import shutil
                     shutil.rmtree(copilot_config_dir, ignore_errors=True)
-            except Exception as e:  # noqa: BLE001
-                logger.warning(f"API key refresh failed: {e}. Clearing cache...")
-                import shutil
-                shutil.rmtree(copilot_config_dir, ignore_errors=True)
-    except Exception as e:  # noqa: BLE001
-        logger.debug(f"Error checking GitHub Copilot API key: {e}")
+                else:
+                    logger.warning("Clearing only API key cache.")
+                    if api_key_file.exists():
+                        api_key_file.unlink()
+        except Exception as e:  # noqa: BLE001
+            logger.warning(f"API key refresh failed: {e}. Clearing only API key cache.")
+            if api_key_file.exists():
+                api_key_file.unlink()
+
+
+def _get_github_copilot_token() -> str | None:
+    """Retrieve the current GitHub Copilot API key from the config file."""
+    try:
+        copilot_config_dir = Path.home() / ".config" / "litellm" / "github_copilot"
+        api_key_file = copilot_config_dir / "api-key.json"
+        if api_key_file.exists():
+            with open(api_key_file) as f:
+                data = json.load(f)
+                return data.get("token")
+    except Exception:
+        return None
+    return None
 
 
 class LLMRequestFailedError(Exception):
@@ -516,8 +542,11 @@ class LLM:
         model_lower = self.config.model_name.lower()
         if "github" in model_lower and "copilot" in model_lower:
             headers = {
-                "editor-version": "vscode/1.85.1",
+                "Editor-Version": "vscode/1.85.1",
+                "Editor-Plugin-Version": "copilot/1.155.0",
+                "User-Agent": "GithubCopilot/1.155.0",
                 "Copilot-Integration-Id": "vscode-chat",
+                "Copilot-Vision-Request": "true",
             }
             logger.info(f"Adding GitHub Copilot headers for model: {self.config.model_name}")
             return headers
@@ -530,6 +559,11 @@ class LLM:
         # Refresh GitHub Copilot token if needed
         _refresh_github_copilot_token_if_needed(self.config.model_name)
 
+        # Explicitly load Copilot token to avoid litellm caching issues
+        copilot_token = None
+        if self.config.model_name and "github" in self.config.model_name.lower() and "copilot" in self.config.model_name.lower():
+            copilot_token = _get_github_copilot_token()
+
         if not self._model_supports_vision():
             messages = self._filter_images_from_messages(messages)
 
@@ -541,6 +575,10 @@ class LLM:
 
         if _LLM_API_KEY:
             completion_args["api_key"] = _LLM_API_KEY
+        elif copilot_token:
+            # Inject the fresh Copilot token directly
+            completion_args["api_key"] = copilot_token
+
         if _LLM_API_BASE:
             completion_args["api_base"] = _LLM_API_BASE
 
@@ -558,7 +596,31 @@ class LLM:
             completion_args["reasoning_effort"] = "high"
 
         queue = get_global_queue()
-        response = await queue.make_request(completion_args)
+        try:
+            response = await queue.make_request(completion_args)
+        except Exception as e:
+            # Check for authentication errors (401)
+            is_auth_error = False
+            if hasattr(e, "status_code") and e.status_code == 401:
+                is_auth_error = True
+            elif hasattr(e, "response") and hasattr(e.response, "status_code") and e.response.status_code == 401:
+                is_auth_error = True
+            elif "authentication" in str(e).lower() or "unauthorized" in str(e).lower():
+                is_auth_error = True
+
+            if is_auth_error and "github" in self.config.model_name.lower() and "copilot" in self.config.model_name.lower():
+                logger.warning(f"Authentication failed for GitHub Copilot ({e}). Forcing token refresh and retrying...")
+                _refresh_github_copilot_token_if_needed(self.config.model_name, force=True)
+                
+                # Reload token after refresh and inject it
+                new_copilot_token = _get_github_copilot_token()
+                if new_copilot_token:
+                    completion_args["api_key"] = new_copilot_token
+                
+                # Retry once
+                response = await queue.make_request(completion_args)
+            else:
+                raise e
 
         self._total_stats.requests += 1
         self._last_request_stats = RequestStats(requests=1)

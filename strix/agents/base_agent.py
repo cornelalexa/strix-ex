@@ -165,7 +165,7 @@ class BaseAgent(metaclass=AgentMeta):
                 continue
 
             if self.state.should_stop():
-                if self.non_interactive:
+                if self.non_interactive or self.state.parent_id:
                     return self.state.final_result or {}
                 await self._enter_waiting_state(tracer)
                 continue
@@ -226,6 +226,13 @@ class BaseAgent(metaclass=AgentMeta):
                 error_msg = str(e)
                 error_details = getattr(e, "details", None)
                 self.state.add_error(error_msg)
+
+                # Check if it's an auth error that we might have fixed
+                if "authentication" in error_msg.lower() or "unauthorized" in error_msg.lower():
+                    # If we are in interactive mode, we can try one more time
+                    # The LLM layer should have already retried, but if it bubbled up here,
+                    # it means it failed even after retry.
+                    pass
 
                 if self.non_interactive:
                     self.state.set_completed({"success": False, "error": error_msg})
@@ -387,6 +394,16 @@ class BaseAgent(metaclass=AgentMeta):
 
         if actions:
             return await self._execute_actions(actions, tracer)
+
+        # If we have content but no actions, the agent failed to call a tool.
+        # We must warn it to prevent infinite loops of text-only responses.
+        warning_msg = (
+            "ERROR: You provided a text response but NO tool calls. "
+            "You MUST use a tool for every interaction. "
+            "Do not write plain text. "
+            "Use <function=tool_name>...</function> syntax."
+        )
+        self.state.add_message("user", warning_msg)
 
         return False
 
