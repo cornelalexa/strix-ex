@@ -93,7 +93,7 @@ Only create a new agent if no existing agent is handling the specific task.</des
         <description>The specific task/objective for the new agent to accomplish</description>
       </parameter>
       <parameter name="name" type="string" required="true">
-        <description>Human-readable name for the agent (for tracking purposes)</description>
+        <description>Human-readable name for the agent (for tracking purposes). MUST be provided.</description>
       </parameter>
       <parameter name="inherit_context" type="boolean" required="false">
         <description>Whether the new agent should inherit parent's conversation history and context</description>
@@ -239,6 +239,42 @@ NOTE: If you are waiting for an agent that is NOT your subagent, you first tell 
   # Coordinate with other agents
   <function=wait_for_message>
   <parameter=reason>Waiting for vulnerability assessment agent to share discovered attack vectors before proceeding with exploitation phase</parameter>
+  </function>
+    </examples>
+  </tool>
+  <tool name="manage_agent">
+    <description>Manage the lifecycle of sub-agents (check status or terminate).
+
+Use this tool to:
+- Check if a sub-agent is still running or stalled ("status")
+- Forcefully terminate a sub-agent that is unresponsive or stuck ("terminate")
+- Clean up agents that have gone rogue</description>
+    <parameters>
+      <parameter name="agent_id" type="string" required="true">
+        <description>The ID of the agent to manage</description>
+      </parameter>
+      <parameter name="action" type="string" required="true">
+        <description>The action to perform: "status" or "terminate"</description>
+      </parameter>
+      <parameter name="reason" type="string" required="false">
+        <description>Reason for the action (especially for termination)</description>
+      </parameter>
+    </parameters>
+    <returns type="Dict[str, Any]">
+      <description>Response containing success status and agent details</description>
+    </returns>
+    <examples>
+  # Check status of a silent agent
+  <function=manage_agent>
+  <parameter=agent_id>agent_123456</parameter>
+  <parameter=action>status</parameter>
+  </function>
+
+  # Terminate a stuck agent
+  <function=manage_agent>
+  <parameter=agent_id>agent_123456</parameter>
+  <parameter=action>terminate</parameter>
+  <parameter=reason>Agent has been unresponsive for 10 minutes</parameter>
   </function>
     </examples>
   </tool>

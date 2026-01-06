@@ -1,6 +1,7 @@
 import logging
 import os
 import threading
+import uuid
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any, Literal
@@ -369,10 +370,13 @@ def view_agent_graph(agent_state: Any) -> dict[str, Any]:
 def create_agent(
     agent_state: Any,
     task: str,
-    name: str,
+    name: str | None = None,
     inherit_context: bool = True,
     prompt_modules: str | None = None,
 ) -> dict[str, Any]:
+    if name is None:
+        name = f"Agent-{uuid.uuid4().hex[:6]}"
+
     try:
         # Enforce hierarchy: Only Root Agent (or agents with no parent) can spawn new agents directly.
         # Sub-agents must request spawns via agent_finish.
@@ -937,3 +941,54 @@ def wait_for_message(
                 "Waiting timeout reached",
             ],
         }
+
+
+@register_tool(sandbox_execution=False)
+def manage_agent(
+    agent_id: str,
+    action: Literal["terminate", "status"],
+    reason: str | None = None,
+) -> dict[str, Any]:
+    if agent_id not in _agent_states:
+        return {
+            "success": False,
+            "error": f"Agent with ID '{agent_id}' not found.",
+            "status": "not_found",
+        }
+
+    state = _agent_states[agent_id]
+
+    if action == "status":
+        node_info = _agent_graph["nodes"].get(agent_id, {})
+        return {
+            "success": True,
+            "agent_id": agent_id,
+            "status": node_info.get("status", "unknown"),
+            "task": state.task,
+            "iteration": state.iteration,
+            "last_updated": state.last_updated,
+            "completed": state.completed,
+            "stop_requested": state.stop_requested,
+        }
+
+    if action == "terminate":
+        if state.completed:
+            return {
+                "success": False,
+                "error": f"Agent '{agent_id}' is already completed.",
+                "status": "completed",
+            }
+
+        state.request_stop()
+
+        # Update graph status
+        if agent_id in _agent_graph["nodes"]:
+            _agent_graph["nodes"][agent_id]["status"] = "terminating"
+
+        return {
+            "success": True,
+            "message": f"Termination requested for agent '{agent_id}'. It should stop shortly.",
+            "status": "terminating",
+        }
+
+    return {"success": False, "error": f"Unknown action: {action}"}
